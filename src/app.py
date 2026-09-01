@@ -1,15 +1,31 @@
 """
 High School Management System API
 
-A super simple FastAPI application that allows students to view and sign up
+A simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
-import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import os
+
+import jwt
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, EmailStr
+
+
+SECRET_KEY = "mergington-school-secret-key"
+ALGORITHM = "HS256"
+TOKEN_EXPIRE_MINUTES = 60
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +34,39 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+# Demo user database for authentication and role handling
+users = {
+    "student@mergington.edu": {
+        "email": "student@mergington.edu",
+        "name": "Student User",
+        "password": "student123",
+        "role": "student",
+        "grade": "10",
+    },
+    "admin@mergington.edu": {
+        "email": "admin@mergington.edu",
+        "name": "School Admin",
+        "password": "admin123",
+        "role": "admin",
+        "grade": None,
+    },
+    "teacher@mergington.edu": {
+        "email": "teacher@mergington.edu",
+        "name": "Teacher User",
+        "password": "teacher123",
+        "role": "teacher",
+        "grade": None,
+    },
+    "clubadvisor@mergington.edu": {
+        "email": "clubadvisor@mergington.edu",
+        "name": "Club Advisor",
+        "password": "advisor123",
+        "role": "club_advisor",
+        "grade": None,
+    },
+}
+
 
 # In-memory activity database
 activities = {
@@ -78,9 +127,111 @@ activities = {
 }
 
 
+def create_token(user: dict) -> str:
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
+    payload = {
+        "sub": user["email"],
+        "role": user["role"],
+        "exp": expires_at,
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+security = HTTPBearer(auto_error=False)
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> dict:
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+        )
+    except jwt.PyJWTError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    email = payload.get("sub")
+    user = users.get(email)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return user
+
+
+def require_role(required_role: str):
+    def role_checker(current_user: dict = Depends(get_current_user)) -> dict:
+        if current_user["role"] != required_role:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"{required_role.replace('_', ' ').title()} access required",
+            )
+        return current_user
+
+    return role_checker
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
+
+
+@app.post("/auth/login")
+def login(payload: LoginRequest):
+    user = users.get(payload.email.lower())
+    if not user or user["password"] != payload.password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+        )
+
+    token = create_token(user)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "email": user["email"],
+            "name": user["name"],
+            "role": user["role"],
+            "grade": user.get("grade"),
+        },
+    }
+
+
+@app.get("/me")
+def get_current_user_profile(current_user: dict = Depends(get_current_user)):
+    return {
+        "email": current_user["email"],
+        "name": current_user["name"],
+        "role": current_user["role"],
+        "grade": current_user.get("grade"),
+    }
+
+
+@app.get("/admin")
+def admin_dashboard(current_user: dict = Depends(require_role("admin"))):
+    return {
+        "email": current_user["email"],
+        "name": current_user["name"],
+        "role": current_user["role"],
+        "message": "Admin dashboard access granted",
+    }
 
 
 @app.get("/activities")
@@ -91,21 +242,17 @@ def get_activities():
 @app.post("/activities/{activity_name}/signup")
 def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
-    # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
     activity = activities[activity_name]
 
-    # Validate student is not already signed up
     if email in activity["participants"]:
         raise HTTPException(
             status_code=400,
             detail="Student is already signed up"
         )
 
-    # Add student
     activity["participants"].append(email)
     return {"message": f"Signed up {email} for {activity_name}"}
 
@@ -113,20 +260,16 @@ def signup_for_activity(activity_name: str, email: str):
 @app.delete("/activities/{activity_name}/unregister")
 def unregister_from_activity(activity_name: str, email: str):
     """Unregister a student from an activity"""
-    # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
     activity = activities[activity_name]
 
-    # Validate student is signed up
     if email not in activity["participants"]:
         raise HTTPException(
             status_code=400,
             detail="Student is not signed up for this activity"
         )
 
-    # Remove student
     activity["participants"].remove(email)
     return {"message": f"Unregistered {email} from {activity_name}"}
